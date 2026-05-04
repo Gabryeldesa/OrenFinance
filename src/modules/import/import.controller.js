@@ -5,10 +5,16 @@ const { supabase } = require('../../lib/supabase')
 const parseMoney = (str) => {
   if (!str || str.toString().trim() === '') return 0
   const clean = str.toString().trim()
-    .replace(/[^0-9,.-]/g, '')
-    .replace(/\./g, '')
-    .replace(',', '.')
-  const val = parseFloat(clean)
+
+  // Formato americano: -50.00 (ponto decimal, sem vírgula)
+  if (/^-?\d+\.\d{2}$/.test(clean)) {
+    const val = parseFloat(clean)
+    return isNaN(val) ? 0 : Math.round(Math.abs(val) * 100)
+  }
+
+  // Formato brasileiro: -50,00 ou -1.234,56
+  const br = clean.replace(/\./g, '').replace(',', '.')
+  const val = parseFloat(br.replace(/[^0-9.-]/g, ''))
   return isNaN(val) ? 0 : Math.round(Math.abs(val) * 100)
 }
 
@@ -109,17 +115,14 @@ const bankLabel = (bank) => ({
 })[bank] || 'Desconhecido'
 
 // ─── Parser Nubank ────────────────────────────────────────────────────────────
-// Formato: Data,Valor,Identificador,Descrição
-// Valor negativo = despesa, positivo = receita
 const parseNubank = (content) => {
   const parsed = Papa.parse(content.trim(), { header: true, skipEmptyLines: true })
   const transactions = []
 
   for (const row of parsed.data) {
-    // Colunas possíveis (Nubank usa UTF-8 sem BOM normalmente)
     const dateRaw = row['Data'] || row['date'] || ''
     const valorRaw = row['Valor'] || row['valor'] || row['value'] || ''
-    const desc = (row['Descrição'] || row['Descricao'] || row['description'] || row['memo'] || '').trim()
+    const desc = (row['Descrição'] || row['Descricao'] || row['DescriÃ§Ã£o'] || row['description'] || row['memo'] || '').trim()
     const docto = row['Identificador'] || row['id'] || ''
 
     const date = parseDate(dateRaw)
@@ -141,9 +144,6 @@ const parseNubank = (content) => {
 }
 
 // ─── Parser Inter ─────────────────────────────────────────────────────────────
-// Formato malformado: cada linha inteira fica dentro de aspas
-// "DATA,""LANÇAMENTO"",""DETALHES"",""DOC"",""VALOR"",""TIPO"""
-// A vírgula no valor decimal quebra o split simples
 const parseInter = (content) => {
   const lines = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
   const transactions = []
@@ -152,16 +152,13 @@ const parseInter = (content) => {
     const line = rawLine.trim()
     if (!line) continue
 
-    // Remove aspas externas
     const inner = (line.startsWith('"') && line.endsWith('"'))
       ? line.slice(1, -1)
       : line
 
-    // Substitui "" por placeholder para não confundir com separador
     const normalized = inner.replace(/""/g, '\x00')
     const parts = normalized.split(',').map(p => p.replace(/\x00/g, '').trim())
 
-    // Mínimo de campos: data, lançamento, detalhes, doc, valor_inteiro, valor_decimal, tipo
     if (parts.length < 6) continue
 
     const dateRaw = parts[0]
@@ -175,13 +172,10 @@ const parseInter = (content) => {
     const doc = parts[3] || ''
     const tipo = parts[parts.length - 1].toLowerCase()
 
-    // Valor: penúltimo campo é centavos, antepenúltimo é inteiros
-    // Ex: partes 4 e 5 = "-28" e "29" → "-28,29"
     const valorIntPart = parts[parts.length - 3] || ''
     const valorDecPart = parts[parts.length - 2] || ''
     const valorStr = `${valorIntPart},${valorDecPart}`
 
-    // Ignora saldo e linhas de controle
     if (isJunkLine(lancamento)) continue
 
     const desc = (detalhes.trim() || lancamento.trim())
@@ -191,8 +185,6 @@ const parseInter = (content) => {
     if (cents === 0) continue
 
     const isExpense = tipo.includes('saída') || tipo.includes('saida') || valorIntPart.startsWith('-')
-
-    // Limpa horário da descrição (Inter coloca "DD/MM HH:MM NOME")
     const cleanDesc = desc.replace(/^\d{2}\/\d{2}\s+\d{2}:\d{2}\s+/, '').trim()
 
     transactions.push({
@@ -208,14 +200,10 @@ const parseInter = (content) => {
 }
 
 // ─── Parser Bradesco ──────────────────────────────────────────────────────────
-// Formato: separador ;, linha extra de cabeçalho, colunas Crédito e Débito separadas
-// "Extrato de: Ag: XXXX | Conta: XXXXX"
-// Data;Histórico;Docto.;Crédito (R$);Débito (R$);Saldo (R$)
 const parseBradesco = (content) => {
   const lines = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
   const transactions = []
 
-  // Acha a linha de cabeçalho real (começa com "Data")
   let headerIdx = -1
   for (let i = 0; i < Math.min(lines.length, 20); i++) {
     if (/^data\s*;/i.test(lines[i].trim())) {
@@ -247,14 +235,11 @@ const parseBradesco = (content) => {
 
     if (credit === 0 && debit === 0) continue
 
-    const amount_cents = credit > 0 ? credit : debit
-    const type = credit > 0 ? 'income' : 'expense'
-
     transactions.push({
       date,
       description: desc.substring(0, 255),
-      amount_cents,
-      type,
+      amount_cents: credit > 0 ? credit : debit,
+      type: credit > 0 ? 'income' : 'expense',
       docto: doc
     })
   }
@@ -263,16 +248,13 @@ const parseBradesco = (content) => {
 }
 
 // ─── Parser Genérico ──────────────────────────────────────────────────────────
-// Tenta detectar colunas automaticamente para bancos desconhecidos
 const findCol = (headers, patterns) =>
   headers.find(h => patterns.some(p => h.toLowerCase().includes(p)))
 
 const parseGeneric = (content) => {
-  // Tenta detectar separador
   const firstLine = content.split('\n')[0] || ''
   const delimiter = (firstLine.match(/;/g) || []).length > (firstLine.match(/,/g) || []).length ? ';' : ','
 
-  // Pula linhas de lixo no topo
   const lines = content.split('\n')
   let startLine = 0
   for (let i = 0; i < Math.min(lines.length, 15); i++) {
@@ -337,13 +319,20 @@ const parseGeneric = (content) => {
   return transactions
 }
 
-// ─── Prepara conteúdo do arquivo ──────────────────────────────────────────────
+// ─── Prepara conteúdo ─────────────────────────────────────────────────────────
 const prepareContent = (buffer) => {
-  // Tenta UTF-8 primeiro, cai para latin1 se houver caracteres inválidos
-  let content = buffer.toString('utf-8').replace(/^\uFEFF/, '') // remove BOM
-  if (content.includes('\uFFFD')) {
+  // Remove BOM UTF-8 se existir
+  let content = buffer.toString('utf-8').replace(/^\uFEFF/, '')
+
+  // Só usa latin1 se realmente tiver caracteres corrompidos E não for Nubank
+  // O Nubank usa UTF-8 — não converter para latin1
+  const hasCorrupted = content.includes('\uFFFD')
+  const looksLikeNubank = content.toLowerCase().includes('identificador') || content.toLowerCase().includes('nubank')
+
+  if (hasCorrupted && !looksLikeNubank) {
     content = buffer.toString('latin1')
   }
+
   return content
 }
 
@@ -360,20 +349,14 @@ const preview = async (req, res) => {
 
     let transactions = []
 
-    if (bank === 'nubank') {
-      transactions = parseNubank(content)
-    } else if (bank === 'inter') {
-      transactions = parseInter(content)
-    } else if (bank === 'bradesco') {
-      transactions = parseBradesco(content)
-    } else {
-      // bb, itau, santander, caixa, c6, sicoob, sicredi, generic
-      transactions = parseGeneric(content)
-    }
+    if (bank === 'nubank') transactions = parseNubank(content)
+    else if (bank === 'inter') transactions = parseInter(content)
+    else if (bank === 'bradesco') transactions = parseBradesco(content)
+    else transactions = parseGeneric(content)
 
     if (transactions.length === 0) {
       return res.status(422).json({
-        error: { message: `Nenhuma transação encontrada. Banco detectado: ${label}. Verifique se o arquivo é um extrato bancário válido.` }
+        error: { message: `Nenhuma transação encontrada. Banco detectado: ${label}.` }
       })
     }
 
@@ -384,7 +367,6 @@ const preview = async (req, res) => {
       .or(`user_id.eq.${userId},user_id.is.null`)
       .is('deleted_at', null)
 
-    // Verifica duplicatas
     const duplicates = new Set()
     for (const tx of transactions) {
       if (!tx.docto) continue
@@ -404,13 +386,7 @@ const preview = async (req, res) => {
     const result = transactions.map(tx => {
       const isDuplicate = duplicates.has(`${tx.date}-${tx.amount_cents}-${tx.docto}`)
       const suggestion = suggestCategory(tx.description, categories || [])
-      return {
-        ...tx,
-        isDuplicate,
-        selected: !isDuplicate,
-        category_id: suggestion.category_id,
-        category_name: suggestion.category_name
-      }
+      return { ...tx, isDuplicate, selected: !isDuplicate, category_id: suggestion.category_id, category_name: suggestion.category_name }
     })
 
     return res.json({
