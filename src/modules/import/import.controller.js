@@ -377,6 +377,7 @@ const preview = async (req, res) => {
         .eq('date', tx.date)
         .eq('amount_cents', tx.amount_cents)
         .eq('import_docto', tx.docto)
+        .is('deleted_at', null)
         .limit(1)
       if (existing && existing.length > 0) {
         duplicates.add(`${tx.date}-${tx.amount_cents}-${tx.docto}`)
