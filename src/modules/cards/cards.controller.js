@@ -1,8 +1,20 @@
 const { supabase } = require('../../lib/supabase')
 
+// Dado um cartão com closing_day, retorna o mês da fatura para uma transação na data dada
+// Se dia da transação > closing_day → vai para o mês seguinte
+const getInvoiceMonth = (dateStr, closingDay) => {
+  const [year, month, day] = dateStr.split('-').map(Number)
+  if (day > closingDay) {
+    // Passa para o mês seguinte
+    const next = new Date(year, month, 1) // month já é 1-based, então month = próximo mês
+    return { year: next.getFullYear(), month: next.getMonth() + 1 }
+  }
+  return { year, month }
+}
+
 const getCards = async (req, res) => {
   try {
-    const userId = req.userId
+    const userId = req.user.id
 
     const { data, error } = await supabase
       .from('credit_cards')
@@ -15,24 +27,31 @@ const getCards = async (req, res) => {
 
     const cardsWithInvoice = await Promise.all(
       data.map(async (card) => {
-        const now = new Date()
-        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1)
-          .toISOString().split('T')[0]
-        const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0)
-          .toISOString().split('T')[0]
-
+        // Busca todas as transações do cartão não deletadas
         const { data: txs } = await supabase
           .from('transactions')
-          .select('amount_cents')
+          .select('amount_cents, date')
           .eq('credit_card_id', card.id)
           .eq('type', 'expense')
           .is('deleted_at', null)
-          .gte('date', startOfMonth)
-          .lte('date', endOfMonth)
 
-        const usedLimit = (txs || []).reduce((acc, t) => acc + t.amount_cents, 0)
+        // Calcula o mês da fatura atual (fatura aberta = próximo vencimento)
+        const now = new Date()
+        const currentMonth = now.getMonth() + 1
+        const currentYear = now.getFullYear()
+
+        // Soma apenas transações que pertencem à fatura do mês atual
+        const usedLimit = (txs || []).reduce((acc, t) => {
+          const { year, month } = getInvoiceMonth(t.date, card.closing_day)
+          if (year === currentYear && month === currentMonth) {
+            return acc + t.amount_cents
+          }
+          return acc
+        }, 0)
+
         const availableLimit = card.limit_cents - usedLimit
 
+        // Busca fatura aberta atual
         const { data: invoice } = await supabase
           .from('invoices')
           .select('*')
@@ -66,7 +85,7 @@ const getCards = async (req, res) => {
 
 const createCard = async (req, res) => {
   try {
-    const userId = req.userId
+    const userId = req.user.id
     const { name, limit_cents, closing_day, due_day, color, account_id } = req.body
 
     if (!name || !limit_cents || !closing_day || !due_day) {
@@ -91,6 +110,7 @@ const createCard = async (req, res) => {
 
     if (error) return res.status(500).json({ error: { message: error.message } })
 
+    // Cria a fatura do mês atual
     const now = new Date()
     const referenceMonth = new Date(now.getFullYear(), now.getMonth(), 1)
       .toISOString().split('T')[0]
@@ -116,7 +136,7 @@ const createCard = async (req, res) => {
 
 const updateCard = async (req, res) => {
   try {
-    const userId = req.userId
+    const userId = req.user.id
     const { id } = req.params
     const { name, limit_cents, closing_day, due_day, color, account_id } = req.body
 
@@ -158,7 +178,7 @@ const updateCard = async (req, res) => {
 
 const deleteCard = async (req, res) => {
   try {
-    const userId = req.userId
+    const userId = req.user.id
     const { id } = req.params
 
     const { data: existing } = await supabase
@@ -189,7 +209,7 @@ const deleteCard = async (req, res) => {
 
 const getInvoices = async (req, res) => {
   try {
-    const userId = req.userId
+    const userId = req.user.id
     const { id } = req.params
 
     const { data: card } = await supabase
@@ -204,6 +224,7 @@ const getInvoices = async (req, res) => {
       return res.status(404).json({ error: { message: 'Cartão não encontrado.' } })
     }
 
+    // Busca faturas reais
     const { data: realInvoices, error } = await supabase
       .from('invoices')
       .select('*')
@@ -212,10 +233,78 @@ const getInvoices = async (req, res) => {
 
     if (error) return res.status(500).json({ error: { message: error.message } })
 
-    const existingMonths = new Set(
-      (realInvoices || []).map(inv => inv.reference_month.substring(0, 7))
+    // Busca TODAS as transações do cartão para montar totais por mês de fatura
+    const { data: allTxs } = await supabase
+      .from('transactions')
+      .select('amount_cents, date, description')
+      .eq('credit_card_id', id)
+      .eq('type', 'expense')
+      .is('deleted_at', null)
+
+    // Agrupa transações por mês de fatura (respeitando o dia de fechamento)
+    const txByInvoiceMonth = {}
+    for (const tx of (allTxs || [])) {
+      const { year, month } = getInvoiceMonth(tx.date, card.closing_day)
+      const key = `${year}-${String(month).padStart(2, '0')}`
+      if (!txByInvoiceMonth[key]) txByInvoiceMonth[key] = 0
+      txByInvoiceMonth[key] += tx.amount_cents
+    }
+
+    // Atualiza os totais das faturas reais e monta o mapa de meses existentes
+    const existingMonths = new Set()
+    const updatedInvoices = await Promise.all(
+      (realInvoices || []).map(async (inv) => {
+        const key = inv.reference_month.substring(0, 7) // "YYYY-MM"
+        existingMonths.add(key)
+        const totalFromTxs = txByInvoiceMonth[key] || 0
+
+        // Atualiza o total na fatura se ela estiver aberta
+        if (inv.status === 'open' && inv.total_cents !== totalFromTxs) {
+          await supabase
+            .from('invoices')
+            .update({ total_cents: totalFromTxs })
+            .eq('id', inv.id)
+        }
+
+        return { ...inv, total_cents: totalFromTxs }
+      })
     )
 
+    // Cria faturas virtuais para meses que têm transações mas não têm fatura real
+    const virtualInvoices = []
+    for (const [key, total] of Object.entries(txByInvoiceMonth)) {
+      if (existingMonths.has(key)) continue
+      if (total === 0) continue
+
+      const [yearStr, monthStr] = key.split('-')
+      const year = Number(yearStr)
+      const month = Number(monthStr)
+
+      // Cria fatura real no banco para esse mês
+      const referenceMonth = `${key}-01`
+      const closingDate = `${key}-${String(card.closing_day).padStart(2, '0')}`
+      const dueDate = `${key}-${String(card.due_day).padStart(2, '0')}`
+
+      const { data: newInvoice } = await supabase
+        .from('invoices')
+        .insert({
+          credit_card_id: id,
+          reference_month: referenceMonth,
+          closing_date: closingDate,
+          due_date: dueDate,
+          total_cents: total,
+          status: 'open'
+        })
+        .select()
+        .single()
+
+      if (newInvoice) {
+        virtualInvoices.push(newInvoice)
+        existingMonths.add(key)
+      }
+    }
+
+    // Previews de parcelas recorrentes futuras
     const { data: rules } = await supabase
       .from('recurring_rules')
       .select('id, description, amount_cents, day_of_month, total_installments, current_installment')
@@ -237,15 +326,16 @@ const getInvoices = async (req, res) => {
         let txYear = now.getFullYear()
         while (txMonth > 11) { txMonth -= 12; txYear++ }
 
-        let invMonth = txMonth
+        let invMonth = txMonth + 1
         let invYear = txYear
-        if (rule.day_of_month > card.closing_day) {
-          invMonth += 1
-          if (invMonth > 11) { invMonth = 0; invYear++ }
+        if (rule.day_of_month <= card.closing_day) {
+          invMonth = txMonth + 1
+        } else {
+          invMonth = txMonth + 2
         }
+        while (invMonth > 12) { invMonth -= 12; invYear++ }
 
-        const key = `${invYear}-${String(invMonth + 1).padStart(2, '0')}`
-
+        const key = `${invYear}-${String(invMonth).padStart(2, '0')}`
         if (existingMonths.has(key)) continue
 
         if (!previewMap[key]) {
@@ -260,13 +350,13 @@ const getInvoices = async (req, res) => {
             paid_at: null
           }
         }
-
         previewMap[key].total_cents += rule.amount_cents
       }
     }
 
     const allInvoices = [
-      ...(realInvoices || []),
+      ...updatedInvoices,
+      ...virtualInvoices,
       ...Object.values(previewMap)
     ].sort((a, b) => b.reference_month.localeCompare(a.reference_month))
 
@@ -278,7 +368,7 @@ const getInvoices = async (req, res) => {
 
 const payInvoice = async (req, res) => {
   try {
-    const userId = req.userId
+    const userId = req.user.id
     const { id, invoiceId } = req.params
 
     const { data: invoice, error: invError } = await supabase
