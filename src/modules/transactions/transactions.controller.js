@@ -13,7 +13,7 @@ const recalculateInvoice = async (invoiceId) => {
 }
 
 const getTransactions = async (req, res) => {
-  const userId = req.userId
+  const userId = req.user.id
   const {
     page = 1, limit = 100, type, category_id, account_id,
     start, end, month, search, sort = 'date', order = 'desc'
@@ -31,7 +31,6 @@ const getTransactions = async (req, res) => {
   if (account_id) query = query.eq('account_id', account_id)
   if (search) query = query.ilike('description', `%${search}%`)
 
-  // Suporte a filtro por mês (YYYY-MM) ou por start/end
   if (month) {
     const [year, mon] = month.split('-')
     const startDate = `${year}-${mon}-01`
@@ -55,7 +54,7 @@ const getTransactions = async (req, res) => {
 }
 
 const getSummary = async (req, res) => {
-  const userId = req.userId
+  const userId = req.user.id
   const { start, end, month } = req.query
 
   let query = supabase
@@ -103,7 +102,7 @@ const createTransaction = async (req, res) => {
       .from('accounts')
       .select('id')
       .eq('id', parsed.data.account_id)
-      .eq('user_id', req.userId)
+      .eq('user_id', req.user.id)
       .is('deleted_at', null)
       .single()
 
@@ -127,7 +126,7 @@ const createTransaction = async (req, res) => {
 
   const { data, error } = await supabase
     .from('transactions')
-    .insert({ ...parsed.data, user_id: req.userId, invoice_id: invoiceId })
+    .insert({ ...parsed.data, user_id: req.user.id, invoice_id: invoiceId })
     .select('*, categories!category_id(id, name, icon, color), accounts(id, name), credit_cards(id, name)')
     .single()
 
@@ -154,7 +153,7 @@ const updateTransaction = async (req, res) => {
     .from('transactions')
     .select('id, invoice_id')
     .eq('id', id)
-    .eq('user_id', req.userId)
+    .eq('user_id', req.user.id)
     .is('deleted_at', null)
     .single()
 
@@ -166,7 +165,7 @@ const updateTransaction = async (req, res) => {
     .from('transactions')
     .update(parsed.data)
     .eq('id', id)
-    .eq('user_id', req.userId)
+    .eq('user_id', req.user.id)
     .select('*, categories!category_id(id, name, icon, color), accounts(id, name), credit_cards(id, name)')
     .single()
 
@@ -182,7 +181,7 @@ const deleteTransaction = async (req, res) => {
     .from('transactions')
     .select('id, invoice_id')
     .eq('id', id)
-    .eq('user_id', req.userId)
+    .eq('user_id', req.user.id)
     .is('deleted_at', null)
     .single()
 
@@ -194,7 +193,7 @@ const deleteTransaction = async (req, res) => {
     .from('transactions')
     .update({ deleted_at: new Date().toISOString() })
     .eq('id', id)
-    .eq('user_id', req.userId)
+    .eq('user_id', req.user.id)
 
   if (error) throw error
   await recalculateInvoice(existing.invoice_id)
