@@ -1,8 +1,11 @@
 const { supabaseAdmin } = require('../../lib/supabaseAdmin')
 
 const getProfile = async (req, res) => {
-  const userId = req.userId
-  
+  const userId = req.user?.id || req.userId
+
+  if (!userId) {
+    return res.status(401).json({ error: { message: 'Não autenticado.' } })
+  }
 
   let { data, error } = await supabaseAdmin
     .from('user_profiles')
@@ -10,7 +13,6 @@ const getProfile = async (req, res) => {
     .eq('id', userId)
     .single()
 
-  // Se não existe perfil, cria um automaticamente
   if (error || !data) {
     const { data: authData } = await supabaseAdmin.auth.admin.getUserById(userId)
     const fullName = authData?.user?.user_metadata?.full_name || ''
@@ -41,12 +43,12 @@ const getProfile = async (req, res) => {
 }
 
 const updateProfile = async (req, res) => {
-  const userId = req.userId
-  const { name, currency, locale } = req.body
+  const userId = req.user?.id || req.userId
+  const { name } = req.body
 
   const { data, error } = await supabaseAdmin
     .from('user_profiles')
-    .update({ name, currency, locale, updated_at: new Date().toISOString() })
+    .update({ name, updated_at: new Date().toISOString() })
     .eq('id', userId)
     .select()
     .single()
@@ -56,7 +58,7 @@ const updateProfile = async (req, res) => {
 }
 
 const changePassword = async (req, res) => {
-  const userId = req.userId
+  const userId = req.user?.id || req.userId
   const { password } = req.body
 
   if (!password || password.length < 6) {
@@ -70,7 +72,7 @@ const changePassword = async (req, res) => {
 }
 
 const deleteAccount = async (req, res) => {
-  const userId = req.userId
+  const userId = req.user?.id || req.userId
 
   await supabaseAdmin.from('transactions').update({ deleted_at: new Date().toISOString() }).eq('user_id', userId)
   await supabaseAdmin.from('accounts').update({ deleted_at: new Date().toISOString() }).eq('user_id', userId)
