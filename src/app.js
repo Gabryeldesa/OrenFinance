@@ -3,6 +3,7 @@ const express = require('express')
 const cors = require('cors')
 const helmet = require('helmet')
 const rateLimit = require('express-rate-limit')
+const compression = require('compression')
 
 const categoryRoutes = require('./modules/categories/categories.routes')
 const accountRoutes = require('./modules/accounts/accounts.routes')
@@ -13,6 +14,7 @@ const app = express()
 const PORT = process.env.PORT || 3001
 
 app.use(helmet())
+app.use(compression())
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   credentials: true
@@ -25,6 +27,14 @@ app.use(rateLimit({
   }
 }))
 app.use(express.json())
+app.use((req, res, next) => {
+  req.setTimeout(10000, () => {
+    res.status(408).json({
+      error: { code: 'TIMEOUT', message: 'Requisição demorou demais. Tente novamente.' }
+    })
+  })
+  next()
+})
 
 app.get('/health', (req, res) => {
   res.json({
