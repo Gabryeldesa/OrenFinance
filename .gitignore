@@ -1,3 +1,6 @@
 node_modules 
 .env 
 dist
+backups/
+backup.bat
+backup.js
