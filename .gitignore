@@ -4,3 +4,4 @@ dist
 backups/
 backup.bat
 backup.js
+logs/

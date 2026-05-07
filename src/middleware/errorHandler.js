@@ -1,6 +1,7 @@
+const logger = require('../lib/logger')
+
 const errorHandler = (err, req, res, next) => {
-  // Mostra o erro no terminal para ajudar a debugar
-  console.error(`❌ Erro em ${req.method} ${req.url}:`, err.message)
+  logger.error(`${req.method} ${req.url} — ${err.message}`)
 
   // Erro de validação do Zod (dados inválidos enviados pelo usuário)
   if (err.name === 'ZodError') {
@@ -35,4 +36,4 @@ const errorHandler = (err, req, res, next) => {
   })
 }
 
-module.exports = { errorHandler } 
+module.exports = { errorHandler }
