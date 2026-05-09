@@ -2,9 +2,14 @@ const Papa = require('papaparse')
 const { supabase } = require('../../lib/supabase')
 
 // ─── Utilitários ──────────────────────────────────────────────────────────────
+const stripQuotes = (str) => {
+  if (!str) return str
+  return str.toString().replace(/^"+|"+$/g, '').trim()
+}
+
 const parseMoney = (str) => {
   if (!str || str.toString().trim() === '') return 0
-  const clean = str.toString().trim()
+  const clean = stripQuotes(str)
 
   // Formato americano: -50.00 (ponto decimal, sem vírgula)
   if (/^-?\d+\.\d{2}$/.test(clean)) {
@@ -20,7 +25,7 @@ const parseMoney = (str) => {
 
 const parseMoneyWithSign = (str) => {
   if (!str || str.toString().trim() === '') return { cents: 0, negative: false }
-  const clean = str.toString().trim()
+  const clean = stripQuotes(str)
   const negative = clean.startsWith('-')
   const cents = parseMoney(clean)
   return { cents, negative }
@@ -28,7 +33,10 @@ const parseMoneyWithSign = (str) => {
 
 const parseDate = (str) => {
   if (!str) return null
-  str = str.toString().trim()
+  // Remove aspas que alguns CSVs incluem nos campos de data
+  str = stripQuotes(str)
+  if (!str) return null
+
   const parts = str.split('/')
   if (parts.length === 3) {
     const [d, m, y] = parts
@@ -122,8 +130,10 @@ const parseNubank = (content) => {
   for (const row of parsed.data) {
     const dateRaw = row['Data'] || row['date'] || ''
     const valorRaw = row['Valor'] || row['valor'] || row['value'] || ''
-    const desc = (row['Descrição'] || row['Descricao'] || row['DescriÃ§Ã£o'] || row['description'] || row['memo'] || '').trim()
-    const docto = row['Identificador'] || row['id'] || ''
+    const desc = stripQuotes(
+      row['Descrição'] || row['Descricao'] || row['DescriÃ§Ã£o'] || row['description'] || row['memo'] || ''
+    )
+    const docto = stripQuotes(row['Identificador'] || row['id'] || '')
 
     const date = parseDate(dateRaw)
     if (!date || !desc || isJunkLine(desc)) continue
@@ -167,9 +177,9 @@ const parseInter = (content) => {
     const date = parseDate(dateRaw)
     if (!date) continue
 
-    const lancamento = parts[1] || ''
-    const detalhes = parts[2] || ''
-    const doc = parts[3] || ''
+    const lancamento = stripQuotes(parts[1] || '')
+    const detalhes = stripQuotes(parts[2] || '')
+    const doc = stripQuotes(parts[3] || '')
     const tipo = parts[parts.length - 1].toLowerCase()
 
     const valorIntPart = parts[parts.length - 3] || ''
@@ -221,11 +231,11 @@ const parseBradesco = (content) => {
     const parts = line.split(';')
     if (parts.length < 5) continue
 
-    const dateRaw = parts[0].trim()
-    const desc = parts[1].trim()
-    const doc = parts[2].trim()
-    const creditRaw = parts[3].trim()
-    const debitRaw = parts[4].trim()
+    const dateRaw = stripQuotes(parts[0])
+    const desc = stripQuotes(parts[1])
+    const doc = stripQuotes(parts[2])
+    const creditRaw = stripQuotes(parts[3])
+    const debitRaw = stripQuotes(parts[4])
 
     const date = parseDate(dateRaw)
     if (!date || !desc || isJunkLine(desc)) continue
@@ -282,7 +292,7 @@ const parseGeneric = (content) => {
   for (const row of parsed.data) {
     const date = parseDate(row[dateCol])
     if (!date) continue
-    const desc = ((row[descCol] || '')).trim()
+    const desc = stripQuotes(row[descCol] || '').trim()
     if (!desc || isJunkLine(desc)) continue
 
     let amount_cents = 0
@@ -312,7 +322,7 @@ const parseGeneric = (content) => {
       description: desc.substring(0, 255),
       amount_cents,
       type,
-      docto: docCol ? (row[docCol] || '').toString().trim() : ''
+      docto: docCol ? stripQuotes(row[docCol] || '').toString() : ''
     })
   }
 
@@ -325,7 +335,6 @@ const prepareContent = (buffer) => {
   let content = buffer.toString('utf-8').replace(/^\uFEFF/, '')
 
   // Só usa latin1 se realmente tiver caracteres corrompidos E não for Nubank
-  // O Nubank usa UTF-8 — não converter para latin1
   const hasCorrupted = content.includes('\uFFFD')
   const looksLikeNubank = content.toLowerCase().includes('identificador') || content.toLowerCase().includes('nubank')
 
@@ -387,7 +396,13 @@ const preview = async (req, res) => {
     const result = transactions.map(tx => {
       const isDuplicate = duplicates.has(`${tx.date}-${tx.amount_cents}-${tx.docto}`)
       const suggestion = suggestCategory(tx.description, categories || [])
-      return { ...tx, isDuplicate, selected: !isDuplicate, category_id: suggestion.category_id, category_name: suggestion.category_name }
+      return {
+        ...tx,
+        isDuplicate,
+        selected: !isDuplicate,
+        category_id: suggestion.category_id,
+        category_name: suggestion.category_name
+      }
     })
 
     return res.json({
@@ -420,14 +435,23 @@ const confirm = async (req, res) => {
       user_id: userId,
       account_id,
       category_id: tx.category_id || null,
-      description: tx.description,
+      // Garante que data e descrição nunca cheguem com aspas residuais
+      description: stripQuotes(tx.description || '').substring(0, 255),
       amount_cents: tx.amount_cents,
       type: tx.type,
-      date: tx.date,
+      date: stripQuotes(tx.date || ''),
       is_confirmed: true,
-      import_docto: tx.docto || null,
+      import_docto: tx.docto ? stripQuotes(tx.docto) : null,
       payment_method: tx.type === 'income' ? null : 'pix'
     }))
+
+    // Validação final: rejeita qualquer linha com data inválida
+    const invalid = rows.find(r => !r.date || !/^\d{4}-\d{2}-\d{2}$/.test(r.date))
+    if (invalid) {
+      return res.status(400).json({
+        error: { message: `Data inválida detectada: "${invalid.date}". Tente novamente.` }
+      })
+    }
 
     const { error } = await supabase.from('transactions').insert(rows)
     if (error) return res.status(500).json({ error: { message: error.message } })
